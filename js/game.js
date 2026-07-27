@@ -15,13 +15,13 @@
       rightHelp: "DRAG to aim the arc · RELEASE to fire",
       duration: 35,
     },
-    bridge: {
-      id: "bridge",
-      name: "Bridge & Bomb",
-      blurb: "Left repairs the bridge. Right drops holes.",
-      leftHelp: "TAP to repair bridge segments",
-      rightHelp: "TAP to drop a bomb / hole",
-      duration: 28,
+    puck: {
+      id: "puck",
+      name: "Puck Duel",
+      blurb: "Air-hockey on one phone. Score on their goal.",
+      leftHelp: "DRAG your paddle · defend left · score right",
+      rightHelp: "DRAG your paddle · defend right · score left",
+      duration: 45,
     },
     hungry: {
       id: "hungry",
@@ -162,8 +162,10 @@
         ? "Steer the wind — keep the balloon alive"
         : "Aim the arc, release to fire spikes";
     }
-    if (mode.id === "bridge") {
-      return role === "left" ? "Get the runner across" : "Drop them through";
+    if (mode.id === "puck") {
+      return role === "left"
+        ? "Drive the puck into their goal"
+        : "Drive the puck into their goal";
     }
     if (mode.id === "hungry") {
       return role === "left" ? "Feed healthy food" : "Feed junk food";
@@ -296,19 +298,8 @@
         aim,
         aiming: false,
       };
-    } else if (mode.id === "bridge") {
-      const segs = 10;
-      state.game = {
-        segs,
-        health: Array(segs).fill(1), // 0 broken, 1 solid
-        runnerX: 0.08,
-        runnerY: 0,
-        runnerVx: 0.12, // fraction of width per second-ish scaled
-        fallen: false,
-        finished: false,
-        bombCd: 0,
-        repairCd: 0,
-      };
+    } else if (mode.id === "puck") {
+      state.game = createPuckGame();
     } else if (mode.id === "hungry") {
       state.game = {
         foods: [],
@@ -553,36 +544,83 @@
     const g = state.game;
     if (!g) return;
     // Balloon right fires via aim arc on pointer up (see fireAimedSpike)
+    // Puck mode: paddles track fingers continuously in updatePuck
+  }
 
-    if (state.modeId === "bridge") {
-      if (role === "left" && g.repairCd <= 0) {
-        // repair weakest / random broken-ish
-        let idx = g.health.findIndex((h) => h < 1);
-        if (idx < 0) idx = Math.floor(Math.random() * g.segs);
-        g.health[idx] = Math.min(1, g.health[idx] + 0.45);
-        g.repairCd = 0.18;
-        sfx("repair");
-        burst(
-          (idx + 0.5) * (window.innerWidth / g.segs),
-          window.innerHeight * 0.62,
-          "#7eb6ff",
-          8
-        );
-      }
-      if (role === "right" && g.bombCd <= 0) {
-        const idx = Math.floor(Math.random() * g.segs);
-        g.health[idx] = Math.max(0, g.health[idx] - 0.55);
-        g.bombCd = 0.28;
-        sfx("bomb");
-        state.shake = 0.2;
-        burst(
-          (idx + 0.5) * (window.innerWidth / g.segs),
-          window.innerHeight * 0.62,
-          "#ff5a3d",
-          14
-        );
-      }
+  function createPuckGame() {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const pr = Math.min(34, h * 0.055);
+    const layout = puckPaddleLayout(pr);
+    return {
+      ball: {
+        x: w / 2,
+        y: h / 2,
+        vx: (Math.random() < 0.5 ? -1 : 1) * 180,
+        vy: (Math.random() - 0.5) * 120,
+        r: Math.min(16, h * 0.028),
+      },
+      paddles: {
+        left: {
+          x: layout.left.x,
+          y: h / 2,
+          r: pr,
+          minX: layout.left.minX,
+          maxX: layout.left.maxX,
+          prevX: layout.left.x,
+          prevY: h / 2,
+        },
+        right: {
+          x: layout.right.x,
+          y: h / 2,
+          r: pr,
+          minX: layout.right.minX,
+          maxX: layout.right.maxX,
+          prevX: layout.right.x,
+          prevY: h / 2,
+        },
+      },
+      scores: { left: 0, right: 0 },
+      goalToWin: 3,
+      serveT: 0.85,
+      lastScorer: null,
+      flash: 0,
+    };
+  }
+
+  /** Paddle lanes based on which physical half owns each logical role. */
+  function puckPaddleLayout(pr) {
+    const w = window.innerWidth;
+    const map = logicalSides();
+    const leftOnLeft = map.physLeft === "left";
+    // Logical left defends the goal on their outer edge
+    if (leftOnLeft) {
+      return {
+        left: {
+          x: w * 0.16,
+          minX: pr + 8,
+          maxX: w * 0.45,
+        },
+        right: {
+          x: w * 0.84,
+          minX: w * 0.55,
+          maxX: w - pr - 8,
+        },
+      };
     }
+    // Swapped: logical left is on physical right
+    return {
+      left: {
+        x: w * 0.84,
+        minX: w * 0.55,
+        maxX: w - pr - 8,
+      },
+      right: {
+        x: w * 0.16,
+        minX: pr + 8,
+        maxX: w * 0.45,
+      },
+    };
   }
 
   // Each frame attach nearest matching food to active pointers
@@ -714,34 +752,175 @@
     );
   }
 
-  function updateBridge(dt) {
+  function updatePuck(dt) {
     const g = state.game;
-    if (g.fallen || g.finished) return;
-    g.bombCd = Math.max(0, g.bombCd - dt);
-    g.repairCd = Math.max(0, g.repairCd - dt);
+    if (!g || state.winner) return;
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const b = g.ball;
 
-    // slow natural decay for drama
-    for (let i = 0; i < g.segs; i++) {
-      g.health[i] = Math.max(0, g.health[i] - 0.015 * dt);
+    g.flash = Math.max(0, g.flash - dt);
+
+    // Track paddles from fingers (logical roles)
+    for (const role of ["left", "right"]) {
+      const pad = g.paddles[role];
+      pad.prevX = pad.x;
+      pad.prevY = pad.y;
+      let finger = null;
+      for (const p of state.pointers.values()) {
+        if (p.role === role && p.holding) {
+          finger = p;
+          break;
+        }
+      }
+      if (finger) {
+        // Smooth follow
+        pad.x += (finger.x - pad.x) * Math.min(1, 18 * dt);
+        pad.y += (finger.y - pad.y) * Math.min(1, 18 * dt);
+        pad.x = Math.max(pad.minX, Math.min(pad.maxX, pad.x));
+        pad.y = Math.max(pad.r + 8, Math.min(h - pad.r - 8, pad.y));
+      }
     }
 
-    const speed = 0.085; // screen fraction / sec
-    g.runnerX += speed * dt;
-
-    const seg = Math.min(g.segs - 1, Math.floor(g.runnerX * g.segs));
-    if (g.health[seg] < 0.28) {
-      g.fallen = true;
-      state.shake = 0.35;
-      sfx("pop");
-      haptic(30);
-      endRound("right");
+    // Serve delay after goal
+    if (g.serveT > 0) {
+      g.serveT -= dt;
+      b.x = w / 2;
+      b.y = h / 2;
+      if (g.serveT <= 0) {
+        const dir = g.lastScorer === "left" ? 1 : g.lastScorer === "right" ? -1 : Math.random() < 0.5 ? -1 : 1;
+        // Serve toward the player who was scored on
+        b.vx = dir * 200;
+        b.vy = (Math.random() - 0.5) * 160;
+      }
       return;
     }
-    if (g.runnerX >= 0.96) {
-      g.finished = true;
-      sfx("win");
-      endRound("left");
+
+    // Integrate ball
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+
+    // Top / bottom walls
+    if (b.y < b.r + 6) {
+      b.y = b.r + 6;
+      b.vy = Math.abs(b.vy) * 0.95;
+      sfx("tap");
     }
+    if (b.y > h - b.r - 6) {
+      b.y = h - b.r - 6;
+      b.vy = -Math.abs(b.vy) * 0.95;
+      sfx("tap");
+    }
+
+    // Side walls (outside goal mouth) bounce; goal mouth scores
+    const goalH = h * 0.34;
+    const goalTop = (h - goalH) / 2;
+    const goalBot = goalTop + goalH;
+    const inGoalY = b.y > goalTop && b.y < goalBot;
+
+    // Left edge
+    if (b.x < b.r + 4) {
+      if (inGoalY) {
+        // Goal against the player defending left physical edge — score for opponent of that defender
+        scorePuckGoal(defenderRoleAtPhysical("left"));
+        return;
+      }
+      b.x = b.r + 4;
+      b.vx = Math.abs(b.vx) * 0.92;
+      sfx("tap");
+    }
+    // Right edge
+    if (b.x > w - b.r - 4) {
+      if (inGoalY) {
+        scorePuckGoal(defenderRoleAtPhysical("right"));
+        return;
+      }
+      b.x = w - b.r - 4;
+      b.vx = -Math.abs(b.vx) * 0.92;
+      sfx("tap");
+    }
+
+    // Paddle collisions
+    for (const role of ["left", "right"]) {
+      collidePuckPaddle(b, g.paddles[role], dt);
+    }
+
+    // Soft speed limits
+    const sp = Math.hypot(b.vx, b.vy);
+    const maxSp = 620;
+    const minSp = 140;
+    if (sp > maxSp) {
+      b.vx = (b.vx / sp) * maxSp;
+      b.vy = (b.vy / sp) * maxSp;
+    } else if (sp < minSp && sp > 1) {
+      b.vx = (b.vx / sp) * minSp;
+      b.vy = (b.vy / sp) * minSp;
+    }
+
+    // Light friction
+    b.vx *= Math.exp(-0.08 * dt);
+    b.vy *= Math.exp(-0.08 * dt);
+  }
+
+  /** Which logical role defends a physical outer edge. */
+  function defenderRoleAtPhysical(edge) {
+    const map = logicalSides();
+    // edge 'left' means physical left goal
+    if (edge === "left") return map.physLeft;
+    return map.physRight;
+  }
+
+  function scorePuckGoal(concedingRole) {
+    const g = state.game;
+    if (!g || state.winner) return;
+    // Other role scores
+    const scorer = concedingRole === "left" ? "right" : "left";
+    g.scores[scorer] += 1;
+    g.lastScorer = scorer;
+    g.flash = 0.45;
+    state.shake = 0.3;
+    sfx("score");
+    haptic(25);
+    burst(g.ball.x, g.ball.y, scorer === "left" ? "#7eb6ff" : "#ff9a84", 22);
+
+    if (g.scores[scorer] >= g.goalToWin) {
+      endRound(scorer);
+      return;
+    }
+    g.serveT = 0.9;
+    g.ball.vx = 0;
+    g.ball.vy = 0;
+  }
+
+  function collidePuckPaddle(ball, pad, dt) {
+    const dx = ball.x - pad.x;
+    const dy = ball.y - pad.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    const minDist = ball.r + pad.r;
+    if (dist >= minDist) return;
+
+    // Separate
+    const nx = dx / dist;
+    const ny = dy / dist;
+    ball.x = pad.x + nx * minDist;
+    ball.y = pad.y + ny * minDist;
+
+    // Paddle velocity from movement
+    const pvx = (pad.x - pad.prevX) / Math.max(dt, 0.001);
+    const pvy = (pad.y - pad.prevY) / Math.max(dt, 0.001);
+
+    // Reflect ball velocity along normal
+    const vn = ball.vx * nx + ball.vy * ny;
+    if (vn < 0) {
+      ball.vx -= 2 * vn * nx;
+      ball.vy -= 2 * vn * ny;
+    }
+    // Add paddle shove
+    ball.vx += pvx * 0.55 + nx * 120;
+    ball.vy += pvy * 0.55 + ny * 40;
+
+    sfx("tap");
+    haptic(8);
   }
 
   function updateHungry(dt) {
@@ -1001,55 +1180,106 @@
     }
   }
 
-  function drawBridge() {
+  function drawPuck() {
     const g = state.game;
     const w = window.innerWidth;
     const h = window.innerHeight;
-    const bridgeY = h * 0.62;
-    const segW = w / g.segs;
+    const goalH = h * 0.34;
+    const goalTop = (h - goalH) / 2;
 
-    // pylons
-    ctx.fillStyle = "#3a4566";
-    ctx.fillRect(0, bridgeY + 18, w, h);
+    // Rink floor
+    ctx.fillStyle = "rgba(20, 40, 70, 0.55)";
+    ctx.fillRect(0, 0, w, h);
 
-    for (let i = 0; i < g.segs; i++) {
-      const hp = g.health[i];
-      const x = i * segW;
-      if (hp <= 0.05) {
-        // hole
-        ctx.fillStyle = "rgba(0,0,0,0.35)";
-        ctx.fillRect(x + 2, bridgeY, segW - 4, 22);
-        continue;
-      }
-      const color =
-        hp > 0.6 ? "#8b6b3e" : hp > 0.3 ? "#a85a2a" : "#6b2a2a";
+    // Center line
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.lineWidth = 3;
+    ctx.setLineDash([10, 10]);
+    ctx.beginPath();
+    ctx.moveTo(w / 2, 12);
+    ctx.lineTo(w / 2, h - 12);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(w / 2, h / 2, 36, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Goals
+    ctx.fillStyle = "rgba(61,139,253,0.22)";
+    ctx.fillRect(0, goalTop, 14, goalH);
+    ctx.strokeStyle = "rgba(126,182,255,0.7)";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(1, goalTop, 12, goalH);
+
+    ctx.fillStyle = "rgba(255,90,61,0.22)";
+    ctx.fillRect(w - 14, goalTop, 14, goalH);
+    ctx.strokeStyle = "rgba(255,154,132,0.7)";
+    ctx.strokeRect(w - 13, goalTop, 12, goalH);
+
+    // Goal flash
+    if (g.flash > 0) {
+      ctx.fillStyle = `rgba(255,209,102,${g.flash * 0.35})`;
+      ctx.fillRect(0, 0, w, h);
+    }
+
+    // Scores
+    ctx.font = "bold 42px Segoe UI, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#7eb6ff";
+    ctx.fillText(String(g.scores.left), w * 0.35, 56);
+    ctx.fillStyle = "#ff9a84";
+    ctx.fillText(String(g.scores.right), w * 0.65, 56);
+    ctx.font = "bold 12px sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.45)";
+    ctx.fillText(`first to ${g.goalToWin}`, w / 2, 74);
+    ctx.textAlign = "left";
+
+    // Paddles
+    const drawPad = (pad, color, glow) => {
+      ctx.shadowColor = glow;
+      ctx.shadowBlur = 16;
       ctx.fillStyle = color;
-      ctx.fillRect(x + 1, bridgeY, segW - 2, 18);
-      ctx.fillStyle = "rgba(255,255,255,0.08)";
-      ctx.fillRect(x + 1, bridgeY, segW - 2, 4);
-    }
-
-    // runner
-    if (!g.fallen) {
-      const rx = g.runnerX * w;
-      const ry = bridgeY - 18;
-      ctx.fillStyle = "#ffd166";
       ctx.beginPath();
-      ctx.arc(rx, ry - 16, 12, 0, Math.PI * 2);
+      ctx.arc(pad.x, pad.y, pad.r, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = "#7eb6ff";
-      ctx.fillRect(rx - 9, ry - 6, 18, 20);
-    } else {
-      const rx = g.runnerX * w;
-      ctx.fillStyle = "rgba(255,90,61,0.8)";
-      ctx.font = "bold 20px sans-serif";
-      ctx.fillText("💥", rx - 12, bridgeY + 50);
-    }
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = "rgba(255,255,255,0.45)";
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.fillStyle = "rgba(255,255,255,0.2)";
+      ctx.beginPath();
+      ctx.arc(pad.x - 4, pad.y - 4, pad.r * 0.35, 0, Math.PI * 2);
+      ctx.fill();
+    };
+    drawPad(g.paddles.left, "#3d8bfd", "#3d8bfd");
+    drawPad(g.paddles.right, "#ff5a3d", "#ff5a3d");
 
-    // finish flag
-    ctx.fillStyle = "#2dd4a8";
-    ctx.fillRect(w - 18, bridgeY - 70, 6, 70);
-    ctx.fillRect(w - 12, bridgeY - 70, 24, 16);
+    // Puck
+    const b = g.ball;
+    if (g.serveT > 0) {
+      ctx.fillStyle = "rgba(255,209,102,0.7)";
+      ctx.font = "bold 16px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Get ready…", w / 2, h / 2 - 40);
+      ctx.textAlign = "left";
+    }
+    ctx.fillStyle = "#f4f7ff";
+    ctx.shadowColor = "#ffd166";
+    ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "rgba(0,0,0,0.25)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Hint
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.font = "bold 11px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("drag paddle on your half", w / 2, h - 14);
+    ctx.textAlign = "left";
   }
 
   function drawHungry() {
@@ -1114,13 +1344,13 @@
       resultTitle.textContent = "LEFT WINS";
       resultSub.textContent = state.swapped
         ? "Logical Left scored — check who held that side!"
-        : "Protectors / builders / greens take the round.";
+        : "Left takes the round.";
       sfx("win");
     } else if (w === "right") {
       resultTitle.textContent = "RIGHT WINS";
       resultSub.textContent = state.swapped
         ? "Logical Right scored — check who held that side!"
-        : "Poppers / bombers / junk food take the round.";
+        : "Right takes the round.";
       sfx("win");
     } else {
       resultTitle.textContent = "DRAW";
@@ -1150,12 +1380,15 @@
       endRound("left");
       burst(state.game.balloon.x, state.game.balloon.y, "#7eb6ff", 20);
       sfx("win");
-    } else if (state.modeId === "bridge") {
-      // if still running, left advantage if past half else right
-      const g = state.game;
-      if (g.fallen) endRound("right");
-      else if (g.finished || g.runnerX > 0.7) endRound("left");
-      else endRound("right");
+    } else if (state.modeId === "puck") {
+      const s = state.game.scores;
+      if (s.left > s.right) endRound("left");
+      else if (s.right > s.left) endRound("right");
+      else {
+        state.winner = "draw";
+        state.running = false;
+        setTimeout(showResult, 400);
+      }
     } else if (state.modeId === "hungry") {
       const s = state.game.scores;
       if (s.left > s.right) endRound("left");
@@ -1208,13 +1441,13 @@
         onTimerEnd();
       }
       if (state.modeId === "balloon") updateBalloon(dt);
-      if (state.modeId === "bridge") updateBridge(dt);
+      if (state.modeId === "puck") updatePuck(dt);
       if (state.modeId === "hungry") updateHungry(dt);
       updateParticles(dt);
     }
 
     if (state.modeId === "balloon") drawBalloon();
-    if (state.modeId === "bridge") drawBridge();
+    if (state.modeId === "puck") drawPuck();
     if (state.modeId === "hungry") drawHungry();
     drawParticles();
 

@@ -15,7 +15,7 @@ Best on a phone or tablet (two people side by side). Desktop works for testing (
 ## Modes
 
 1. **Balloon Treaty** — Left blows the balloon up; Right fires spikes.
-2. **Bridge & Bomb** — Left repairs; Right bombs; runner tries to cross.
+2. **Puck Duel** — Air-hockey paddles; first to 3 goals (or most when time ends).
 3. **Hungry vs Healthy** — Drag your foods into the mouth; highest score wins.
 
 Best of 3 series. Rematch or **switch sides** after each round.
