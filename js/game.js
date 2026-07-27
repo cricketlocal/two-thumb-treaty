@@ -10,10 +10,10 @@
     balloon: {
       id: "balloon",
       name: "Balloon Treaty",
-      blurb: "Left keeps the balloon up. Right tries to pop it.",
-      leftHelp: "TAP / HOLD left side to blow the balloon UP",
-      rightHelp: "TAP right side to launch spikes",
-      duration: 30,
+      blurb: "Left steers the wind. Right tries to pop the balloon.",
+      leftHelp: "HOLD left half: wind follows your finger (↑↓←→)",
+      rightHelp: "TAP to fire a spike (cooldown)",
+      duration: 35,
     },
     bridge: {
       id: "bridge",
@@ -158,7 +158,9 @@
 
   function goalText(mode, role) {
     if (mode.id === "balloon") {
-      return role === "left" ? "Keep the balloon alive" : "Pop the balloon";
+      return role === "left"
+        ? "Steer the wind — keep the balloon alive"
+        : "Pop the balloon with spikes";
     }
     if (mode.id === "bridge") {
       return role === "left" ? "Get the runner across" : "Drop them through";
@@ -277,13 +279,17 @@
       state.game = {
         balloon: {
           x: window.innerWidth / 2,
-          y: window.innerHeight * 0.55,
-          r: Math.min(42, window.innerWidth * 0.07),
-          vy: -20,
+          y: window.innerHeight * 0.5,
+          r: Math.min(38, window.innerWidth * 0.065),
+          vy: 0,
           vx: 0,
         },
-        wind: 0, // left force upward
+        // wind vector from left player (-1..1-ish)
+        windX: 0,
+        windY: 0,
         spikes: [],
+        spikeCd: 0,
+        maxSpikes: 2,
         popped: false,
       };
     } else if (mode.id === "bridge") {
@@ -343,11 +349,47 @@
     state.pointers.delete(e.pointerId);
   }
 
-  function leftHolding() {
+  /** Left wind: direction from left-zone center to finger (up/down/left/right). */
+  function getLeftWind() {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    // Center of the physical half currently controlled by logical left
+    const map = logicalSides();
+    const leftIsPhysLeft = map.physLeft === "left";
+    const zoneCx = leftIsPhysLeft ? w * 0.25 : w * 0.75;
+    const zoneCy = h * 0.55;
+    // Dead zone so small finger wobble doesn't fight you
+    const dead = Math.min(w, h) * 0.04;
+    // Max reach for full power
+    const maxR = Math.min(w * 0.22, h * 0.35);
+
+    let wx = 0;
+    let wy = 0;
+    let any = false;
     for (const p of state.pointers.values()) {
-      if (p.role === "left" && p.holding) return true;
+      if (p.role !== "left" || !p.holding) continue;
+      any = true;
+      let dx = p.x - zoneCx;
+      let dy = p.y - zoneCy;
+      const dist = Math.hypot(dx, dy);
+      if (dist < dead) {
+        // Hold near center = gentle float / hover (slight upward bias)
+        wx += 0;
+        wy += -0.35;
+      } else {
+        const scale = Math.min(1, (dist - dead) / (maxR - dead));
+        wx += (dx / dist) * scale;
+        wy += (dy / dist) * scale;
+      }
     }
-    return false;
+    if (!any) return { x: 0, y: 0, active: false, zoneCx, zoneCy, maxR };
+    // Average if multi-touch, clamp
+    const len = Math.hypot(wx, wy) || 1;
+    if (len > 1) {
+      wx /= len;
+      wy /= len;
+    }
+    return { x: wx, y: wy, active: true, zoneCx, zoneCy, maxR };
   }
 
   function handleTap(role, x, y) {
@@ -355,23 +397,30 @@
     if (!g) return;
 
     if (state.modeId === "balloon" && role === "right" && !g.popped) {
-      // launch spike from bottom-right-ish toward balloon
+      // Cooldown + max spikes so left can dodge
+      if (g.spikeCd > 0) return;
+      if (g.spikes.length >= g.maxSpikes) return;
+
       const fromX = x;
-      const fromY = window.innerHeight - 20;
+      const fromY = y;
       const bx = g.balloon.x;
       const by = g.balloon.y;
-      const dx = bx - fromX;
-      const dy = by - fromY;
-      const len = Math.hypot(dx, dy) || 1;
-      const speed = 520;
+      let dx = bx - fromX;
+      let dy = by - fromY;
+      // Imperfect aim — spread so it's not a free laser
+      const spread = 0.22;
+      const ang = Math.atan2(dy, dx) + (Math.random() - 0.5) * spread;
+      const speed = 300;
       g.spikes.push({
         x: fromX,
         y: fromY,
-        vx: (dx / len) * speed,
-        vy: (dy / len) * speed,
-        life: 1.6,
+        vx: Math.cos(ang) * speed,
+        vy: Math.sin(ang) * speed,
+        life: 2.2,
       });
+      g.spikeCd = 0.55;
       sfx("tap");
+      haptic(10);
     }
 
     if (state.modeId === "bridge") {
@@ -450,51 +499,86 @@
     const g = state.game;
     if (g.popped) return;
 
-    // wind from left hold
-    g.wind = leftHolding() ? 1 : 0;
+    g.spikeCd = Math.max(0, g.spikeCd - dt);
+
+    const wind = getLeftWind();
+    g.windX = wind.x;
+    g.windY = wind.y;
+    g.windActive = wind.active;
+    g.windPad = wind;
+
     const b = g.balloon;
-    const gravity = 160;
-    const lift = 380;
+    // Mild gravity so Left must keep managing height
+    const gravity = 95;
+    const windPower = 520;
+    const drag = 1.8;
 
     b.vy += gravity * dt;
-    b.vy -= g.wind * lift * dt;
-    // gentle drift
-    b.vx += (Math.sin(performance.now() / 400) * 30 - b.vx) * dt;
-    // keep near center-ish with soft bounds
+    if (wind.active) {
+      b.vx += wind.x * windPower * dt;
+      b.vy += wind.y * windPower * dt;
+    }
+    // Air drag so steering is responsive, not ice-rink
+    b.vx *= Math.exp(-drag * dt);
+    b.vy *= Math.exp(-drag * dt);
+    // Soft speed cap
+    const sp = Math.hypot(b.vx, b.vy);
+    const maxSp = 420;
+    if (sp > maxSp) {
+      b.vx = (b.vx / sp) * maxSp;
+      b.vy = (b.vy / sp) * maxSp;
+    }
+
     b.x += b.vx * dt;
     b.y += b.vy * dt;
 
-    const minY = 80;
-    const maxY = window.innerHeight - 40;
+    const minY = 70;
+    const maxY = window.innerHeight - 36;
+    const minX = b.r + 8;
+    const maxX = window.innerWidth - b.r - 8;
     if (b.y < minY) {
       b.y = minY;
-      b.vy *= -0.3;
+      b.vy *= -0.35;
     }
     if (b.y > maxY) {
       b.y = maxY;
-      b.vy = -Math.abs(b.vy) * 0.4;
+      b.vy = -Math.abs(b.vy) * 0.45;
     }
-    const midx = window.innerWidth / 2;
-    b.x += (midx - b.x) * 0.4 * dt;
-    b.x = Math.max(b.r + 10, Math.min(window.innerWidth - b.r - 10, b.x));
+    if (b.x < minX) {
+      b.x = minX;
+      b.vx *= -0.4;
+    }
+    if (b.x > maxX) {
+      b.x = maxX;
+      b.vx *= -0.4;
+    }
+    // No center pull — Left must dodge with wind
 
-    // spikes
+    // spikes (tighter hit = harder pop)
+    const hitR = b.r * 0.72;
     for (const s of g.spikes) {
       s.x += s.vx * dt;
       s.y += s.vy * dt;
       s.life -= dt;
-      if (Math.hypot(s.x - b.x, s.y - b.y) < b.r - 4) {
+      if (Math.hypot(s.x - b.x, s.y - b.y) < hitR) {
         g.popped = true;
         state.shake = 0.45;
         burst(b.x, b.y, "#ff7a90", 28);
         burst(b.x, b.y, "#ffffff", 12);
         sfx("pop");
         haptic(40);
-        endRound("right"); // logical right pops
+        endRound("right");
         return;
       }
     }
-    g.spikes = g.spikes.filter((s) => s.life > 0 && s.y > -40);
+    g.spikes = g.spikes.filter(
+      (s) =>
+        s.life > 0 &&
+        s.x > -40 &&
+        s.y > -40 &&
+        s.x < window.innerWidth + 40 &&
+        s.y < window.innerHeight + 40
+    );
   }
 
   function updateBridge(dt) {
@@ -583,6 +667,52 @@
       ctx.fill();
     }
 
+    // Wind pad on left player's zone (direction guide)
+    if (g.windPad) {
+      const { zoneCx, zoneCy, maxR } = g.windPad;
+      ctx.strokeStyle = "rgba(126,182,255,0.28)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(zoneCx, zoneCy, maxR * 0.85, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = "rgba(126,182,255,0.12)";
+      ctx.beginPath();
+      ctx.arc(zoneCx, zoneCy, 10, 0, Math.PI * 2);
+      ctx.fill();
+      // Cross guides ↑↓←→
+      ctx.strokeStyle = "rgba(126,182,255,0.2)";
+      ctx.beginPath();
+      ctx.moveTo(zoneCx, zoneCy - maxR * 0.75);
+      ctx.lineTo(zoneCx, zoneCy + maxR * 0.75);
+      ctx.moveTo(zoneCx - maxR * 0.75, zoneCy);
+      ctx.lineTo(zoneCx + maxR * 0.75, zoneCy);
+      ctx.stroke();
+      ctx.fillStyle = "rgba(126,182,255,0.45)";
+      ctx.font = "bold 14px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("↑", zoneCx, zoneCy - maxR * 0.75 - 6);
+      ctx.fillText("↓", zoneCx, zoneCy + maxR * 0.75 + 16);
+      ctx.fillText("←", zoneCx - maxR * 0.75 - 12, zoneCy + 5);
+      ctx.fillText("→", zoneCx + maxR * 0.75 + 12, zoneCy + 5);
+      ctx.textAlign = "left";
+
+      if (g.windActive) {
+        const ax = zoneCx + g.windX * maxR * 0.7;
+        const ay = zoneCy + g.windY * maxR * 0.7;
+        ctx.strokeStyle = "rgba(126,182,255,0.9)";
+        ctx.lineWidth = 4;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(zoneCx, zoneCy);
+        ctx.lineTo(ax, ay);
+        ctx.stroke();
+        ctx.fillStyle = "#7eb6ff";
+        ctx.beginPath();
+        ctx.arc(ax, ay, 8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
     // string
     if (!g.popped) {
       ctx.strokeStyle = "rgba(255,255,255,0.35)";
@@ -611,14 +741,27 @@
       ctx.lineTo(b.x + 6, b.y + b.r - 6);
       ctx.lineTo(b.x, b.y + b.r + 6);
       ctx.fill();
-    }
 
-    // wind indicator
-    if (g.wind) {
-      ctx.fillStyle = "rgba(126,182,255,0.35)";
-      for (let i = 0; i < 5; i++) {
-        const yy = b.y + 50 + i * 18;
-        ctx.fillRect(20, yy, 40 + Math.random() * 30, 4);
+      // Wind arrow on balloon
+      if (g.windActive && (Math.abs(g.windX) > 0.05 || Math.abs(g.windY) > 0.05)) {
+        const ang = Math.atan2(g.windY, g.windX);
+        ctx.save();
+        ctx.translate(b.x, b.y);
+        ctx.rotate(ang);
+        ctx.strokeStyle = "rgba(126,182,255,0.95)";
+        ctx.fillStyle = "rgba(126,182,255,0.95)";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(b.r + 4, 0);
+        ctx.lineTo(b.r + 28, 0);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(b.r + 32, 0);
+        ctx.lineTo(b.r + 20, 7);
+        ctx.lineTo(b.r + 20, -7);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
       }
     }
 
@@ -635,6 +778,15 @@
       ctx.closePath();
       ctx.fill();
       ctx.restore();
+    }
+
+    // Right cooldown pip
+    if (g.spikeCd > 0) {
+      ctx.fillStyle = "rgba(255,154,132,0.85)";
+      ctx.font = "bold 12px sans-serif";
+      ctx.textAlign = "right";
+      ctx.fillText("spike reloading…", w - 16, h - 18);
+      ctx.textAlign = "left";
     }
   }
 
