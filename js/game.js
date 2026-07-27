@@ -10,9 +10,9 @@
     balloon: {
       id: "balloon",
       name: "Balloon Treaty",
-      blurb: "Left steers the wind. Right tries to pop the balloon.",
+      blurb: "Left steers the wind. Right aims an arc and fires spikes.",
       leftHelp: "HOLD left half: wind follows your finger (↑↓←→)",
-      rightHelp: "TAP to fire a spike (cooldown)",
+      rightHelp: "DRAG to aim the arc · RELEASE to fire",
       duration: 35,
     },
     bridge: {
@@ -160,7 +160,7 @@
     if (mode.id === "balloon") {
       return role === "left"
         ? "Steer the wind — keep the balloon alive"
-        : "Pop the balloon with spikes";
+        : "Aim the arc, release to fire spikes";
     }
     if (mode.id === "bridge") {
       return role === "left" ? "Get the runner across" : "Drop them through";
@@ -276,6 +276,7 @@
     state.pointers.clear();
 
     if (mode.id === "balloon") {
+      const aim = defaultRightAim();
       state.game = {
         balloon: {
           x: window.innerWidth / 2,
@@ -291,6 +292,9 @@
         spikeCd: 0,
         maxSpikes: 2,
         popped: false,
+        // Right aim arc
+        aim,
+        aiming: false,
       };
     } else if (mode.id === "bridge") {
       const segs = 10;
@@ -316,6 +320,64 @@
     }
   }
 
+  /** Default aim arc for the logical right player (toward the field). */
+  function defaultRightAim() {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const map = logicalSides();
+    const rightIsPhysRight = map.physRight === "right";
+    // Pivot sits on the outer edge of the right player's half
+    const pivotX = rightIsPhysRight ? w * 0.9 : w * 0.1;
+    const pivotY = h * 0.55;
+    // Aim toward screen center
+    const angle = Math.atan2(h * 0.45 - pivotY, w * 0.5 - pivotX);
+    return {
+      pivotX,
+      pivotY,
+      angle,
+      arcRadius: Math.min(w, h) * 0.28,
+      // Angle range facing into the playfield
+      minAngle: rightIsPhysRight ? -Math.PI * 0.92 : -Math.PI * 0.08,
+      maxAngle: rightIsPhysRight ? -Math.PI * 0.08 : Math.PI * 0.08,
+      // fix ranges properly below in clampAimAngle
+      facingLeft: rightIsPhysRight,
+    };
+  }
+
+  /** Clamp aim so spikes fire into the field with limited up/down pitch. */
+  function clampAimAngle(angle, facingLeft) {
+    let a = angle;
+    while (a > Math.PI) a -= Math.PI * 2;
+    while (a < -Math.PI) a += Math.PI * 2;
+    const maxPitch = 1.2;
+    const sin = Math.max(
+      -Math.sin(maxPitch),
+      Math.min(Math.sin(maxPitch), Math.sin(a))
+    );
+    const cos = facingLeft
+      ? -Math.max(0.2, Math.abs(Math.cos(a)))
+      : Math.max(0.2, Math.abs(Math.cos(a)));
+    return Math.atan2(sin, cos);
+  }
+
+  function aimArcEnds(facingLeft) {
+    const maxPitch = 1.2;
+    if (facingLeft) {
+      // Upper-left → lower-left through straight left (±π)
+      return {
+        a0: Math.atan2(-Math.sin(maxPitch), -1),
+        a1: Math.atan2(Math.sin(maxPitch), -1),
+        acw: false, // clockwise through ±π
+      };
+    }
+    // Upper-right → lower-right through straight right (0)
+    return {
+      a0: Math.atan2(-Math.sin(maxPitch), 1),
+      a1: Math.atan2(Math.sin(maxPitch), 1),
+      acw: true,
+    };
+  }
+
   // ——— Input ———
   function onPointerDown(e) {
     if (!state.running) return;
@@ -325,7 +387,26 @@
     const y = e.clientY - rect.top;
     const phys = sideOfX(x);
     const role = roleForPhys(phys);
-    state.pointers.set(e.pointerId, { x, y, phys, role, holding: true });
+    state.pointers.set(e.pointerId, {
+      x,
+      y,
+      phys,
+      role,
+      holding: true,
+      downAt: performance.now(),
+      startX: x,
+      startY: y,
+    });
+
+    // Balloon right: start aiming only (fire on release)
+    if (state.modeId === "balloon" && role === "right" && state.game && !state.game.popped) {
+      state.game.aiming = true;
+      updateRightAimFromPointers();
+      sfx("tap");
+      haptic(6);
+      return;
+    }
+
     handleTap(role, x, y);
     sfx("tap");
     haptic(8);
@@ -342,11 +423,87 @@
     p.phys = sideOfX(p.x);
     p.role = roleForPhys(p.phys);
 
+    if (state.modeId === "balloon" && p.role === "right" && state.game) {
+      state.game.aiming = true;
+      updateRightAimFromPointers();
+    }
     // hungry mode drag is resolved each frame in updateHungryDrag()
   }
 
   function onPointerUp(e) {
+    const p = state.pointers.get(e.pointerId);
+    if (
+      p &&
+      state.modeId === "balloon" &&
+      p.role === "right" &&
+      state.game &&
+      !state.game.popped &&
+      state.running
+    ) {
+      updateRightAimFromPointers();
+      fireAimedSpike();
+      // If no other right pointers, stop aiming highlight
+      state.pointers.delete(e.pointerId);
+      let stillAiming = false;
+      for (const q of state.pointers.values()) {
+        if (q.role === "right" && q.holding) stillAiming = true;
+      }
+      state.game.aiming = stillAiming;
+      return;
+    }
     state.pointers.delete(e.pointerId);
+  }
+
+  function updateRightAimFromPointers() {
+    const g = state.game;
+    if (!g || !g.aim) return;
+    // Refresh pivot in case of rotate/resize
+    const base = defaultRightAim();
+    g.aim.pivotX = base.pivotX;
+    g.aim.pivotY = base.pivotY;
+    g.aim.arcRadius = base.arcRadius;
+    g.aim.facingLeft = base.facingLeft;
+
+    let finger = null;
+    for (const p of state.pointers.values()) {
+      if (p.role === "right" && p.holding) {
+        finger = p;
+        break;
+      }
+    }
+    if (!finger) return;
+
+    // Angle from pivot to finger = aim direction
+    const ang = Math.atan2(finger.y - g.aim.pivotY, finger.x - g.aim.pivotX);
+    g.aim.angle = clampAimAngle(ang, g.aim.facingLeft);
+  }
+
+  function fireAimedSpike() {
+    const g = state.game;
+    if (!g || g.popped) return;
+    if (g.spikeCd > 0) return;
+    if (g.spikes.length >= g.maxSpikes) return;
+
+    const { pivotX, pivotY, angle, arcRadius } = g.aim;
+    const speed = 340;
+    // Spawn at rim of aim arc
+    const spawnR = arcRadius * 0.55;
+    g.spikes.push({
+      x: pivotX + Math.cos(angle) * spawnR,
+      y: pivotY + Math.sin(angle) * spawnR,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 2.4,
+    });
+    g.spikeCd = 0.65;
+    sfx("bomb");
+    haptic(14);
+    burst(
+      pivotX + Math.cos(angle) * spawnR,
+      pivotY + Math.sin(angle) * spawnR,
+      "#ffd166",
+      10
+    );
   }
 
   /** Left wind: direction from left-zone center to finger (up/down/left/right). */
@@ -395,33 +552,7 @@
   function handleTap(role, x, y) {
     const g = state.game;
     if (!g) return;
-
-    if (state.modeId === "balloon" && role === "right" && !g.popped) {
-      // Cooldown + max spikes so left can dodge
-      if (g.spikeCd > 0) return;
-      if (g.spikes.length >= g.maxSpikes) return;
-
-      const fromX = x;
-      const fromY = y;
-      const bx = g.balloon.x;
-      const by = g.balloon.y;
-      let dx = bx - fromX;
-      let dy = by - fromY;
-      // Imperfect aim — spread so it's not a free laser
-      const spread = 0.22;
-      const ang = Math.atan2(dy, dx) + (Math.random() - 0.5) * spread;
-      const speed = 300;
-      g.spikes.push({
-        x: fromX,
-        y: fromY,
-        vx: Math.cos(ang) * speed,
-        vy: Math.sin(ang) * speed,
-        life: 2.2,
-      });
-      g.spikeCd = 0.55;
-      sfx("tap");
-      haptic(10);
-    }
+    // Balloon right fires via aim arc on pointer up (see fireAimedSpike)
 
     if (state.modeId === "bridge") {
       if (role === "left" && g.repairCd <= 0) {
@@ -500,6 +631,8 @@
     if (g.popped) return;
 
     g.spikeCd = Math.max(0, g.spikeCd - dt);
+    // Keep aim tracking while finger is down
+    updateRightAimFromPointers();
 
     const wind = getLeftWind();
     g.windX = wind.x;
@@ -713,6 +846,83 @@
       }
     }
 
+    // Right aim arc (protractor + trajectory)
+    if (g.aim) {
+      const { pivotX, pivotY, angle, arcRadius, facingLeft } = g.aim;
+      const { a0, a1, acw } = aimArcEnds(facingLeft);
+      const hot = g.aiming || g.spikeCd <= 0;
+
+      // Arc rail
+      ctx.beginPath();
+      ctx.strokeStyle = hot
+        ? "rgba(255,154,132,0.55)"
+        : "rgba(255,154,132,0.28)";
+      ctx.lineWidth = 6;
+      ctx.lineCap = "round";
+      ctx.arc(pivotX, pivotY, arcRadius, a0, a1, acw);
+      ctx.stroke();
+
+      // Soft wedge fill
+      ctx.beginPath();
+      ctx.moveTo(pivotX, pivotY);
+      ctx.arc(pivotX, pivotY, arcRadius, a0, a1, acw);
+      ctx.closePath();
+      ctx.fillStyle = g.aiming
+        ? "rgba(255,90,61,0.14)"
+        : "rgba(255,90,61,0.06)";
+      ctx.fill();
+
+      // Pivot cannon
+      ctx.fillStyle = "#ff9a84";
+      ctx.beginPath();
+      ctx.arc(pivotX, pivotY, 12, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,0.35)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Aim needle on arc
+      const nx = pivotX + Math.cos(angle) * arcRadius;
+      const ny = pivotY + Math.sin(angle) * arcRadius;
+      ctx.strokeStyle = g.spikeCd > 0 ? "rgba(255,209,102,0.4)" : "#ffd166";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(pivotX, pivotY);
+      ctx.lineTo(nx, ny);
+      ctx.stroke();
+      ctx.fillStyle = g.spikeCd > 0 ? "rgba(255,209,102,0.5)" : "#ffd166";
+      ctx.beginPath();
+      ctx.arc(nx, ny, 9, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Predicted shot line (dashed)
+      ctx.save();
+      ctx.setLineDash([8, 8]);
+      ctx.strokeStyle = g.aiming
+        ? "rgba(255,209,102,0.75)"
+        : "rgba(255,209,102,0.35)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(pivotX + Math.cos(angle) * 16, pivotY + Math.sin(angle) * 16);
+      ctx.lineTo(
+        pivotX + Math.cos(angle) * arcRadius * 2.4,
+        pivotY + Math.sin(angle) * arcRadius * 2.4
+      );
+      ctx.stroke();
+      ctx.restore();
+
+      // Label
+      ctx.fillStyle = "rgba(255,154,132,0.75)";
+      ctx.font = "bold 11px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(
+        g.spikeCd > 0 ? "…" : g.aiming ? "release to fire" : "drag arc to aim",
+        pivotX + (facingLeft ? -arcRadius * 0.2 : arcRadius * 0.2),
+        pivotY + arcRadius + 22
+      );
+      ctx.textAlign = "left";
+    }
+
     // string
     if (!g.popped) {
       ctx.strokeStyle = "rgba(255,255,255,0.35)";
@@ -784,8 +994,9 @@
     if (g.spikeCd > 0) {
       ctx.fillStyle = "rgba(255,154,132,0.85)";
       ctx.font = "bold 12px sans-serif";
-      ctx.textAlign = "right";
-      ctx.fillText("spike reloading…", w - 16, h - 18);
+      ctx.textAlign = g.aim && g.aim.facingLeft ? "right" : "left";
+      const tx = g.aim && g.aim.facingLeft ? w - 16 : 16;
+      ctx.fillText("spike reloading…", tx, h - 18);
       ctx.textAlign = "left";
     }
   }
