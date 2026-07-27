@@ -27,9 +27,9 @@
       id: "hungry",
       name: "Hungry vs Healthy",
       blurb: "Feed your foods into the mouth. Highest score wins.",
-      leftHelp: "DRAG greens into the mouth",
-      rightHelp: "DRAG junk into the mouth",
-      duration: 32,
+      leftHelp: "DRAG 🥦 greens into the mouth (center)",
+      rightHelp: "DRAG 🍔 junk into the mouth (center)",
+      duration: 35,
     },
   };
 
@@ -303,11 +303,18 @@
     } else if (mode.id === "hungry") {
       state.game = {
         foods: [],
-        spawnT: 0,
+        nextFoodId: 1,
+        spawnT: 0.15,
         scores: { left: 0, right: 0 },
-        mouth: { x: window.innerWidth / 2, y: window.innerHeight * 0.28, r: 48 },
-        drag: null, // {id, foodIndex}
+        mouth: {
+          x: window.innerWidth / 2,
+          y: window.innerHeight * 0.3,
+          r: Math.min(58, window.innerWidth * 0.1),
+        },
+        chompT: 0,
       };
+      // Pre-spawn a few so the round isn't empty
+      for (let i = 0; i < 6; i++) spawnFood(true);
     }
   }
 
@@ -372,12 +379,16 @@
   // ——— Input ———
   function onPointerDown(e) {
     if (!state.running) return;
+    // Avoid browser scrolling / gesture interference during play
+    e.preventDefault?.();
     canvas.setPointerCapture?.(e.pointerId);
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
     const phys = sideOfX(x);
     const role = roleForPhys(phys);
+    // IMPORTANT: lock role at touch-down so dragging across midline
+    // (e.g. hungry → mouth) does not flip teams and drop food.
     state.pointers.set(e.pointerId, {
       x,
       y,
@@ -387,12 +398,21 @@
       downAt: performance.now(),
       startX: x,
       startY: y,
+      foodId: null,
     });
 
     // Balloon right: start aiming only (fire on release)
     if (state.modeId === "balloon" && role === "right" && state.game && !state.game.popped) {
       state.game.aiming = true;
       updateRightAimFromPointers();
+      sfx("tap");
+      haptic(6);
+      return;
+    }
+
+    // Hungry: grab nearest matching food immediately
+    if (state.modeId === "hungry" && state.game) {
+      grabHungryFood(e.pointerId, x, y, role);
       sfx("tap");
       haptic(6);
       return;
@@ -407,18 +427,26 @@
     if (!state.running) return;
     const p = state.pointers.get(e.pointerId);
     if (!p) return;
+    e.preventDefault?.();
     const rect = canvas.getBoundingClientRect();
     p.x = e.clientX - rect.left;
     p.y = e.clientY - rect.top;
-    // keep role locked to original half for fairness? recompute:
-    p.phys = sideOfX(p.x);
-    p.role = roleForPhys(p.phys);
+    // Do NOT reassign p.role from x — keep locked role from pointerdown
 
     if (state.modeId === "balloon" && p.role === "right" && state.game) {
       state.game.aiming = true;
       updateRightAimFromPointers();
     }
-    // hungry mode drag is resolved each frame in updateHungryDrag()
+
+    if (state.modeId === "hungry" && state.game) {
+      // If not holding food yet, keep trying to grab while dragging
+      if (p.foodId == null) {
+        grabHungryFood(e.pointerId, p.x, p.y, p.role);
+      } else {
+        moveHeldHungryFood(e.pointerId, p.x, p.y);
+        tryScoreHungryFood(e.pointerId);
+      }
+    }
   }
 
   function onPointerUp(e) {
@@ -433,7 +461,6 @@
     ) {
       updateRightAimFromPointers();
       fireAimedSpike();
-      // If no other right pointers, stop aiming highlight
       state.pointers.delete(e.pointerId);
       let stillAiming = false;
       for (const q of state.pointers.values()) {
@@ -442,7 +469,99 @@
       state.game.aiming = stillAiming;
       return;
     }
+
+    // Hungry: release food (drop it) or score if over mouth
+    if (p && state.modeId === "hungry" && state.game) {
+      tryScoreHungryFood(e.pointerId);
+      releaseHungryFood(e.pointerId);
+    }
+
     state.pointers.delete(e.pointerId);
+  }
+
+  function grabHungryFood(pid, x, y, role) {
+    const g = state.game;
+    if (!g) return;
+    const p = state.pointers.get(pid);
+    if (!p) return;
+    let best = -1;
+    let bestD = 72; // generous grab radius
+    for (let i = 0; i < g.foods.length; i++) {
+      const f = g.foods[i];
+      if (f.dead || f.heldBy != null) continue;
+      if (f.team !== role) continue;
+      const d = Math.hypot(f.x - x, f.y - y);
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    if (best < 0) return;
+    const f = g.foods[best];
+    f.heldBy = pid;
+    f.held = true;
+    f.vx = 0;
+    f.vy = 0;
+    f.x = x;
+    f.y = y;
+    p.foodId = f.id;
+    sfx("repair");
+  }
+
+  function moveHeldHungryFood(pid, x, y) {
+    const g = state.game;
+    if (!g) return;
+    const p = state.pointers.get(pid);
+    if (!p || p.foodId == null) return;
+    const f = g.foods.find((food) => food.id === p.foodId);
+    if (!f || f.dead) {
+      p.foodId = null;
+      return;
+    }
+    f.x = x;
+    f.y = y;
+    f.vx = 0;
+    f.vy = 0;
+    f.held = true;
+    f.heldBy = pid;
+  }
+
+  function tryScoreHungryFood(pid) {
+    const g = state.game;
+    if (!g) return false;
+    const p = state.pointers.get(pid);
+    if (!p || p.foodId == null) return false;
+    const f = g.foods.find((food) => food.id === p.foodId);
+    if (!f || f.dead) return false;
+    const m = g.mouth;
+    if (Math.hypot(f.x - m.x, f.y - m.y) < m.r + f.r + 8) {
+      f.dead = true;
+      f.held = false;
+      f.heldBy = null;
+      p.foodId = null;
+      g.scores[f.team] += 1;
+      sfx("score");
+      burst(m.x, m.y, f.team === "left" ? "#2dd4a8" : "#ffd166", 18);
+      haptic(14);
+      // Mouth chomp feedback
+      g.chompT = 0.18;
+      return true;
+    }
+    return false;
+  }
+
+  function releaseHungryFood(pid) {
+    const g = state.game;
+    if (!g) return;
+    const p = state.pointers.get(pid);
+    if (!p || p.foodId == null) return;
+    const f = g.foods.find((food) => food.id === p.foodId);
+    if (f && !f.dead) {
+      f.held = false;
+      f.heldBy = null;
+      f.vy = 40;
+    }
+    p.foodId = null;
   }
 
   function updateRightAimFromPointers() {
@@ -623,44 +742,19 @@
     };
   }
 
-  // Each frame attach nearest matching food to active pointers
+  // Sticky drag + score checks while fingers are down
   function updateHungryDrag() {
     const g = state.game;
     if (!g) return;
-    const claimed = new Set();
     for (const [pid, p] of state.pointers) {
-      let best = -1;
-      let bestD = 40;
-      for (let i = 0; i < g.foods.length; i++) {
-        if (claimed.has(i)) continue;
-        const f = g.foods[i];
-        if (f.eaten || f.team !== p.role) continue;
-        const d = Math.hypot(f.x - p.x, f.y - p.y);
-        if (d < bestD) {
-          bestD = d;
-          best = i;
-        }
-      }
-      if (best >= 0) {
-        const f = g.foods[best];
-        f.x = p.x;
-        f.y = p.y;
-        f.held = true;
-        claimed.add(best);
-        const m = g.mouth;
-        if (Math.hypot(f.x - m.x, f.y - m.y) < m.r + f.r * 0.6) {
-          f.eaten = true;
-          f.held = false;
-          g.scores[f.team] += 1;
-          sfx("score");
-          burst(m.x, m.y, f.team === "left" ? "#2dd4a8" : "#ffd166", 14);
-          haptic(12);
-        }
+      if (!p.holding) continue;
+      if (p.foodId == null) {
+        grabHungryFood(pid, p.x, p.y, p.role);
+      } else {
+        moveHeldHungryFood(pid, p.x, p.y);
+        tryScoreHungryFood(pid);
       }
     }
-    g.foods.forEach((f, i) => {
-      if (!claimed.has(i)) f.held = false;
-    });
   }
 
   // ——— Update modes ———
@@ -925,41 +1019,72 @@
 
   function updateHungry(dt) {
     const g = state.game;
+    if (!g) return;
+    g.chompT = Math.max(0, (g.chompT || 0) - dt);
     g.spawnT -= dt;
-    if (g.spawnT <= 0) {
-      g.spawnT = 0.55;
-      spawnFood();
+    // Keep a healthy number of foods on screen
+    const alive = g.foods.filter((f) => !f.dead).length;
+    if (g.spawnT <= 0 || alive < 5) {
+      g.spawnT = 0.45;
+      spawnFood(false);
+      if (alive < 4) spawnFood(false);
     }
     for (const f of g.foods) {
-      if (f.eaten || f.held) continue;
-      f.vy += 40 * dt;
+      if (f.dead || f.held) continue;
+      f.vy += 55 * dt;
       f.y += f.vy * dt;
       f.x += f.vx * dt;
-      if (f.y > window.innerHeight + 40) f.eaten = true; // recycle
+      // Bounce lightly off side walls of own half
+      const w = window.innerWidth;
+      if (f.team === "left") {
+        if (f.x < f.r + 8) {
+          f.x = f.r + 8;
+          f.vx = Math.abs(f.vx);
+        }
+        if (f.x > w / 2 - f.r - 8) {
+          f.x = w / 2 - f.r - 8;
+          f.vx = -Math.abs(f.vx);
+        }
+      } else {
+        if (f.x < w / 2 + f.r + 8) {
+          f.x = w / 2 + f.r + 8;
+          f.vx = Math.abs(f.vx);
+        }
+        if (f.x > w - f.r - 8) {
+          f.x = w - f.r - 8;
+          f.vx = -Math.abs(f.vx);
+        }
+      }
+      if (f.y > window.innerHeight + 50) f.dead = true;
     }
-    g.foods = g.foods.filter((f) => !f.eaten);
+    g.foods = g.foods.filter((f) => !f.dead);
     updateHungryDrag();
   }
 
-  function spawnFood() {
+  function spawnFood(startInView) {
     const g = state.game;
+    if (!g) return;
     const team = Math.random() < 0.5 ? "left" : "right";
     const w = window.innerWidth;
+    const h = window.innerHeight;
     const x =
       team === "left"
-        ? 40 + Math.random() * (w / 2 - 80)
-        : w / 2 + 40 + Math.random() * (w / 2 - 80);
-    const emojis = team === "left" ? ["🥦", "🥕", "🍎", "🥗"] : ["🍔", "🍩", "🍕", "🍟"];
+        ? 36 + Math.random() * (w / 2 - 72)
+        : w / 2 + 36 + Math.random() * (w / 2 - 72);
+    const emojis =
+      team === "left" ? ["🥦", "🥕", "🍎", "🥗", "🍇"] : ["🍔", "🍩", "🍕", "🍟", "🍪"];
     g.foods.push({
+      id: g.nextFoodId++,
       x,
-      y: -30,
-      vx: (Math.random() - 0.5) * 20,
-      vy: 40 + Math.random() * 40,
-      r: 22,
+      y: startInView ? 80 + Math.random() * (h * 0.45) : -30 - Math.random() * 40,
+      vx: (Math.random() - 0.5) * 30,
+      vy: startInView ? 20 + Math.random() * 30 : 30 + Math.random() * 40,
+      r: 28,
       team,
       emoji: emojis[Math.floor(Math.random() * emojis.length)],
       held: false,
-      eaten: false,
+      heldBy: null,
+      dead: false,
     });
   }
 
@@ -1285,42 +1410,97 @@
   function drawHungry() {
     const g = state.game;
     const m = g.mouth;
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const chomp = g.chompT > 0 ? 1 - g.chompT / 0.18 : 0;
+
+    // Lane tints
+    ctx.fillStyle = "rgba(61,139,253,0.08)";
+    ctx.fillRect(0, 0, w / 2, h);
+    ctx.fillStyle = "rgba(255,90,61,0.08)";
+    ctx.fillRect(w / 2, 0, w / 2, h);
+
+    // Mouth target ring
+    ctx.strokeStyle = "rgba(255,255,255,0.2)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 6]);
+    ctx.beginPath();
+    ctx.arc(m.x, m.y, m.r + 14, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
 
     // mouth
+    const mouthScale = 1 + chomp * 0.12;
+    ctx.save();
+    ctx.translate(m.x, m.y);
+    ctx.scale(mouthScale, mouthScale);
     ctx.fillStyle = "#2a1830";
     ctx.beginPath();
-    ctx.ellipse(m.x, m.y, m.r * 1.2, m.r, 0, 0, Math.PI * 2);
+    ctx.ellipse(0, 0, m.r * 1.15, m.r, 0, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = "#ff6b8a";
     ctx.beginPath();
-    ctx.ellipse(m.x, m.y + 4, m.r * 0.85, m.r * 0.65, 0, 0, Math.PI * 2);
+    ctx.ellipse(0, 6, m.r * 0.9, m.r * 0.55 * (1 - chomp * 0.5), 0, 0, Math.PI * 2);
     ctx.fill();
     ctx.strokeStyle = "#fff";
-    ctx.lineWidth = 3;
+    ctx.lineWidth = 4;
     ctx.beginPath();
-    ctx.arc(m.x, m.y - 2, m.r * 0.7, 0.15, Math.PI - 0.15);
+    ctx.arc(0, -2, m.r * 0.72, 0.2, Math.PI - 0.2);
     ctx.stroke();
+    ctx.restore();
+
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.font = "bold 13px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("FEED ME", m.x, m.y - m.r - 18);
+    ctx.textAlign = "left";
 
     // scores
-    ctx.font = "bold 28px Segoe UI, sans-serif";
+    ctx.font = "bold 36px Segoe UI, sans-serif";
     ctx.fillStyle = "#7eb6ff";
-    ctx.fillText(String(g.scores.left), 24, 100);
+    ctx.fillText(String(g.scores.left), 20, 92);
     ctx.fillStyle = "#ff9a84";
     ctx.textAlign = "right";
-    ctx.fillText(String(g.scores.right), window.innerWidth - 24, 100);
+    ctx.fillText(String(g.scores.right), w - 20, 92);
+    ctx.textAlign = "left";
+    ctx.font = "bold 12px sans-serif";
+    ctx.fillStyle = "rgba(126,182,255,0.75)";
+    ctx.fillText("LEFT · healthy", 20, 110);
+    ctx.fillStyle = "rgba(255,154,132,0.75)";
+    ctx.textAlign = "right";
+    ctx.fillText("junk · RIGHT", w - 20, 110);
     ctx.textAlign = "left";
 
     // foods
-    ctx.font = "28px serif";
     for (const f of g.foods) {
-      if (f.eaten) continue;
-      ctx.fillText(f.emoji, f.x - 14, f.y + 10);
-      ctx.strokeStyle = f.team === "left" ? "rgba(126,182,255,0.6)" : "rgba(255,90,61,0.6)";
-      ctx.lineWidth = 2;
+      if (f.dead) continue;
+      // circle backing so emoji is easy to see / hit
       ctx.beginPath();
+      ctx.fillStyle = f.held
+        ? f.team === "left"
+          ? "rgba(126,182,255,0.45)"
+          : "rgba(255,154,132,0.45)"
+        : f.team === "left"
+          ? "rgba(61,139,253,0.22)"
+          : "rgba(255,90,61,0.22)";
       ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = f.team === "left" ? "#7eb6ff" : "#ff9a84";
+      ctx.lineWidth = f.held ? 4 : 2;
       ctx.stroke();
+      ctx.font = `${Math.floor(f.r * 1.35)}px serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(f.emoji, f.x, f.y + 1);
+      ctx.textBaseline = "alphabetic";
+      ctx.textAlign = "left";
     }
+
+    ctx.fillStyle = "rgba(255,255,255,0.4)";
+    ctx.font = "bold 12px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("grab your food · drag into the mouth", w / 2, h - 14);
+    ctx.textAlign = "left";
   }
 
   // ——— Round flow ———
